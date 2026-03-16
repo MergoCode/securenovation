@@ -1,8 +1,9 @@
 import express from "express";
 import ngrok from "ngrok";
-import fs from "fs/promises";
+import { pool } from "./db.js";
+
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
@@ -10,73 +11,143 @@ app.get("/", (req, res) => {
   res.send("Hello, SecureNovation!");
 });
 
-async function readDatabase() {
-  try {
-    const rawData = await fs.readFile("./UID_Decipher.json", "utf8");
+// POST /api/register-uid
+app.post("/api/register-uid", async (req, res) => {
+  const { uid, username } = req.body;
 
-    const parsedData = JSON.parse(rawData);
-
-    return parsedData;
-  } catch (error) {
-    console.error("Помилка читання файлу:", error.message);
-    return null;
+  if (!uid || !username) {
+    return res.status(400).json({ success: false, message: "uid and username are required" });
   }
-}
 
-app.post("/api/lock-status", (req, res) => {
-  const { status, message } = req.body;
+  try {
+    const result = await pool.query(
+      "INSERT INTO users (uid, username) VALUES ($1, $2) ON CONFLICT (uid) DO UPDATE SET username = EXCLUDED.username RETURNING id, uid, username, is_admin",
+      [uid, username],
+    );
 
-  console.log(`[${new Date().toLocaleTimeString()}] Оновлення статусу:`);
-  console.log(`Статус: ${status} | Повідомлення: ${message}`);
-
-  res.status(200).json({
-    success: true,
-    message: "Сервер успішно прийняв дані",
-  });
+    return res.status(201).json({
+      success: true,
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error registering UID:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
 });
 
+// GET /api/logs
+app.get("/api/logs", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT event, timestamp, nfc_id, message FROM logs ORDER BY timestamp DESC",
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (error) {
+    console.error("Error fetching logs:", error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// GET /api/lock-status
+app.get("/api/lock-status", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT status, message FROM lock_status ORDER BY updated_at DESC LIMIT 1",
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(200).json({ status: false, message: null });
+    }
+
+    const { status, message } = result.rows[0];
+
+    return res.status(200).json({ status, message });
+  } catch (error) {
+    console.error("Error fetching lock status:", error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// POST /api/lock-status (update from device)
+app.post("/api/lock-status", async (req, res) => {
+  const { status, message } = req.body;
+
+  if (typeof status !== "boolean") {
+    return res.status(400).json({ success: false, message: "status (boolean) is required" });
+  }
+
+  try {
+    await pool.query(
+      "INSERT INTO lock_status (status, message) VALUES ($1, $2)",
+      [status, message || null],
+    );
+
+    console.log(`[${new Date().toISOString()}] Lock status updated: ${status}, message: ${message}`);
+
+    return res.status(200).json({
+      success: true,
+      message: "Lock status updated",
+    });
+  } catch (error) {
+    console.error("Error updating lock status:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /api/lock-event -> save to logs
 app.post("/api/lock-event", async (req, res) => {
-  const NFC_decipher_obj = await readDatabase();
-  const { event, timestamp } = req.body;
-  console.log(`[${new Date().toLocaleTimeString()}] Подія замка:`);
-  if (event.includes("password")) {
-    if (event === "success_password") {
-      console.log(`Lock unlocked by password, time: ${timestamp}`);
-    } else if (event === "failed_password") {
-      console.log(`Failed password attempt, time: ${timestamp}`);
-    }
+  const { event, timestamp, nfc_id, message } = req.body;
+
+  if (!event || !timestamp) {
+    return res.status(400).json({ success: false, message: "event and timestamp are required" });
   }
 
-  else if (event.includes("nfc")) {
-    const nfcId = req.body.nfc_id;
-    if (event === "success_nfc") {
-      const userName = NFC_decipher_obj.find(el => el.UID.replaceAll(":", "") === nfcId)?.username || "Unknown NFC ID";
-      console.log(
-        `Lock unlocked by NFC; \nTime: ${timestamp}; \nNFC ID: ${nfcId}; NFC_USER: ${userName}`,
-      );
-    } else if (event === "failed_nfc") {
-      console.log(
-        `Failed NFC attempt; \nTime: ${timestamp}; \nNFC ID: ${nfcId}`,
-      );
-    }
+  try {
+    await pool.query(
+      "INSERT INTO logs (event, timestamp, nfc_id, message) VALUES ($1, $2, $3, $4)",
+      [event, timestamp, nfc_id || null, message || null],
+    );
+
+    console.log(`[${new Date().toISOString()}] Lock event: ${event}, ts: ${timestamp}`);
+
+    return res.status(201).json({ success: true });
+  } catch (error) {
+    console.error("Error saving lock event:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// POST /api/login-user
+app.post("/api/login-user", async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: "username and password are required",
+    });
   }
 
-  else {
-    if (event === "alarm") {
-      console.log("ALARM: BREAK IN!");
-    } else if (event === "lock") {
-      console.log(`Lock engaged, time: ${timestamp}`);
-    } else {
-      console.log(`Unknown event: ${event}, time: ${timestamp}`);
-    }
+  const adminUsername = process.env.ADMIN_USERNAME || "admin";
+  const adminPassword = process.env.ADMIN_PASSWORD || "admin_password";
+
+  if (username === adminUsername && password === adminPassword) {
+    return res.status(200).json({
+      success: true,
+      message: "Login successful",
+    });
   }
-  console.log(`Подія: ${event} | Час: ${timestamp}`);
+
+  return res.status(401).json({
+    success: false,
+    message: "Invalid credentials",
+  });
 });
 
 app.listen(PORT, () => {
   console.log(`Сервер запущено на http://localhost:${PORT}`);
 });
-
 
 /* 
 Ендпоінти:
