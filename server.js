@@ -1,83 +1,150 @@
 import express from "express";
-import ngrok from "ngrok";
-import fs from "fs/promises";
+import pkg from "pg";
+const { Pool } = pkg;
+
 const app = express();
 const PORT = 3000;
 
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.send("Hello, SecureNovation!");
+// Налаштування підключення до БД (введи свої дані)
+const pool = new Pool({
+  user: "postgres",
+  host: "localhost",
+  database: "smart_lock", // назва твоєї БД
+  password: "your_password", // твій пароль
+  port: 5432,
 });
 
-async function readDatabase() {
+// Глобальна змінна для статусу замка
+let isDoorUnlocked = false;
+
+app.get("/", (req, res) => {
+  res.send("Hello, SecureNovation API is running!");
+});
+
+// --- ЕНДПОІНТИ ДЛЯ МОБІЛЬНОГО ДОДАТКУ ---
+
+// 1. Реєстрація картки/користувача
+app.post("/api/register-uid", async (req, res) => {
+  const { uid, username, password = "default_password" } = req.body; // пароль потрібен для логіну
   try {
-    const rawData = await fs.readFile("./UID_Decipher.json", "utf8");
-
-    const parsedData = JSON.parse(rawData);
-
-    return parsedData;
+    const result = await pool.query(
+      "INSERT INTO users (uid, username, password) VALUES ($1, $2, $3) RETURNING *",
+      [uid, username, password]
+    );
+    res.status(201).json({ success: true, user: result.rows[0] });
   } catch (error) {
-    console.error("Помилка читання файлу:", error.message);
-    return null;
+    console.error("Помилка реєстрації:", error);
+    res.status(500).json({ success: false, message: error.message });
   }
-}
+});
 
-app.post("/api/lock-status", (req, res) => {
-  const { status, message } = req.body;
+// 2. Отримання логів
+app.get("/api/logs", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-  console.log(`[${new Date().toLocaleTimeString()}] Оновлення статусу:`);
-  console.log(`Статус: ${status} | Повідомлення: ${message}`);
-
-  res.status(200).json({
-    success: true,
-    message: "Сервер успішно прийняв дані",
+// 3. Статус замка
+app.get("/api/lock-status", (req, res) => {
+  res.json({
+    status: isDoorUnlocked,
+    message: isDoorUnlocked ? "Door is unlocked" : "Door is locked",
   });
 });
 
-app.post("/api/lock-event", async (req, res) => {
-  const NFC_decipher_obj = await readDatabase();
-  const { event, timestamp } = req.body;
-  console.log(`[${new Date().toLocaleTimeString()}] Подія замка:`);
-  if (event.includes("password")) {
-    if (event === "success_password") {
-      console.log(`Lock unlocked by password, time: ${timestamp}`);
-    } else if (event === "failed_password") {
-      console.log(`Failed password attempt, time: ${timestamp}`);
-    }
-  }
+// 4. Логін користувача
+app.post("/api/login-user", async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const result = await pool.query(
+      "SELECT * FROM users WHERE username = $1 AND password = $2",
+      [username, password]
+    );
 
-  else if (event.includes("nfc")) {
-    const nfcId = req.body.nfc_id;
-    if (event === "success_nfc") {
-      const userName = NFC_decipher_obj.find(el => el.UID.replaceAll(":", "") === nfcId)?.username || "Unknown NFC ID";
-      console.log(
-        `Lock unlocked by NFC; \nTime: ${timestamp}; \nNFC ID: ${nfcId}; NFC_USER: ${userName}`,
-      );
-    } else if (event === "failed_nfc") {
-      console.log(
-        `Failed NFC attempt; \nTime: ${timestamp}; \nNFC ID: ${nfcId}`,
-      );
-    }
-  }
-
-  else {
-    if (event === "alarm") {
-      console.log("ALARM: BREAK IN!");
-    } else if (event === "lock") {
-      console.log(`Lock engaged, time: ${timestamp}`);
+    if (result.rows.length > 0) {
+      res.json({ success: true, message: "Login successful", user: { username, isAdmin: result.rows[0].is_admin } });
     } else {
-      console.log(`Unknown event: ${event}, time: ${timestamp}`);
+      res.status(401).json({ success: false, message: "Invalid credentials" });
     }
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
-  console.log(`Подія: ${event} | Час: ${timestamp}`);
+});
+
+
+// --- ЕНДПОІНТ ДЛЯ ESP32 (ХАРДВАРУ) ---
+
+app.post("/api/lock-event", async (req, res) => {
+  const { event, timestamp, nfc_id } = req.body;
+  let logMessage = "";
+  let currentUserName = "Unknown";
+
+  console.log(`\n[${new Date().toLocaleTimeString()}] Подія замка: ${event}`);
+
+  try {
+    // Якщо це NFC, шукаємо користувача в базі
+    if (nfc_id) {
+      const userResult = await pool.query("SELECT username FROM users WHERE uid = $1", [nfc_id]);
+      if (userResult.rows.length > 0) {
+        currentUserName = userResult.rows[0].username;
+      }
+    }
+
+    // Обробка логіки івентів
+    if (event.includes("password")) {
+      if (event === "success_password") {
+        isDoorUnlocked = true;
+        logMessage = "Lock unlocked by password";
+      } else if (event === "failed_password") {
+        logMessage = "Failed password attempt";
+      }
+    } 
+    else if (event.includes("nfc")) {
+      if (event === "success_nfc") {
+        isDoorUnlocked = true;
+        logMessage = `Lock unlocked by NFC. User: ${currentUserName}`;
+      } else if (event === "failed_nfc") {
+        logMessage = `Failed NFC attempt`;
+      }
+    } 
+    else {
+      if (event === "alarm") {
+        isDoorUnlocked = false;
+        logMessage = "ALARM: BREAK IN!";
+      } else if (event === "lock") {
+        isDoorUnlocked = false;
+        logMessage = "Lock manually engaged";
+      } else {
+        logMessage = `Unknown event: ${event}`;
+      }
+    }
+
+    // Вивід у консоль
+    console.log(`Текст: ${logMessage} | ESP Timestamp: ${timestamp} | NFC ID: ${nfc_id || "N/A"}`);
+
+    // Запис логу в БД (час згенерує сам Postgres)
+    await pool.query(
+      "INSERT INTO logs (event, nfc_id, message) VALUES ($1, $2, $3)",
+      [event, nfc_id || null, logMessage]
+    );
+
+    res.status(200).send("Event logged successfully");
+
+  } catch (error) {
+    console.error("Помилка обробки івенту:", error);
+    res.status(500).send("Server Error");
+  }
 });
 
 app.listen(PORT, () => {
   console.log(`Сервер запущено на http://localhost:${PORT}`);
 });
-
-
 /* 
 Ендпоінти:
 1) POST /api/register-uid: Ендпоінт для реєстрації карточки в базі, приймає на вхід JSON: {
